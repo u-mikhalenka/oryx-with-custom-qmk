@@ -4,7 +4,7 @@
 #define QUICK_TAP_TERM 0
 
 #define USB_SUSPEND_WAKEUP_DELAY 0
-#define SERIAL_NUMBER "bZe3A/nlP499"
+#define SERIAL_NUMBER "bZe3A/eaZ4WK"
 #define LAYER_STATE_16BIT
 #define COMBO_COUNT 5
 
