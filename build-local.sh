@@ -234,13 +234,9 @@ else
 fi
 
 printf 'Merging Oryx export into custom branch state\n'
-if git -C "$MAIN_REPO" remote get-url "$ORYX_REMOTE_NAME" >/dev/null 2>&1; then
-  git -C "$MAIN_REPO" remote set-url "$ORYX_REMOTE_NAME" "$ORYX_REPO"
-else
-  git -C "$MAIN_REPO" remote add "$ORYX_REMOTE_NAME" "$ORYX_REPO"
-fi
-git -C "$MAIN_REPO" fetch "$ORYX_REMOTE_NAME" oryx >/dev/null
-git -C "$MAIN_REPO" merge -Xignore-all-space --no-edit "$ORYX_REMOTE_NAME/oryx" >/dev/null
+ORYX_HEAD=$(git -C "$MAIN_REPO" rev-parse HEAD)
+git -C "$MAIN_REPO" checkout -B main origin/main >/dev/null
+git -C "$MAIN_REPO" merge -Xignore-all-space --no-edit "$ORYX_HEAD" >/dev/null
 
 printf 'Updating cached ZSA QMK checkout to firmware%s\n' "$FIRMWARE_VERSION"
 sync_qmk_branch "$FIRMWARE_VERSION"
