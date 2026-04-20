@@ -85,27 +85,28 @@ git -C "$REPO_ROOT" rev-parse --verify main >/dev/null 2>&1 || fail "Missing loc
 git -C "$REPO_ROOT" rev-parse --verify oryx >/dev/null 2>&1 || fail "Missing local branch: oryx"
 
 if [[ -n $(git -C "$REPO_ROOT" status --porcelain) ]]; then
-  printf 'Warning: repository has uncommitted changes; the build uses the committed tips of the local main and oryx branches.\n' >&2
+  printf 'Warning: repository has uncommitted changes; the build uses the committed tips of local main and oryx, and working-copy layout changes are ignored.\n' >&2
+fi
+
+if git -C "$REPO_ROOT" worktree list --porcelain | grep -Fxq 'branch refs/heads/oryx'; then
+  fail "The local oryx branch is checked out in a worktree. Switch that worktree away from oryx before running this script."
 fi
 
 LOCAL_BUILD_ROOT=$REPO_ROOT/.local-build
-CACHE_ROOT=$LOCAL_BUILD_ROOT/cache
-RUN_ROOT=$CACHE_ROOT/run
-MAIN_REPO=$CACHE_ROOT/main
-ORYX_REPO=$CACHE_ROOT/oryx
+RUN_ROOT=$LOCAL_BUILD_ROOT/run
 QMK_REPO=$LOCAL_BUILD_ROOT/qmk
-DOWNLOADED_LAYOUT_DIR=$RUN_ROOT/downloaded-layout
-SOURCE_ZIP=$RUN_ROOT/source.zip
 ORYX_REMOTE_NAME=local-build-oryx
 QMK_REMOTE_URL=https://github.com/zsa/qmk_firmware.git
 
-ensure_clone() {
+mkdir -p "$LOCAL_BUILD_ROOT"
+MAIN_REPO=$RUN_ROOT/main
+ORYX_REPO=$RUN_ROOT/oryx
+DOWNLOADED_LAYOUT_DIR=$RUN_ROOT/downloaded-layout
+SOURCE_ZIP=$RUN_ROOT/source.zip
+
+clone_branch() {
   local repo_path=$1
   local branch_name=$2
-
-  if [[ -d $repo_path/.git ]] && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    return
-  fi
 
   if [[ -e $repo_path ]]; then
     rm -rf "$repo_path"
@@ -113,18 +114,6 @@ ensure_clone() {
 
   mkdir -p "$(dirname "$repo_path")"
   git clone --branch "$branch_name" "$REPO_ROOT" "$repo_path" >/dev/null
-}
-
-reset_clone() {
-  local repo_path=$1
-  local branch_name=$2
-
-  ensure_clone "$repo_path" "$branch_name"
-  git -C "$repo_path" remote set-url origin "$REPO_ROOT"
-  git -C "$repo_path" fetch --prune origin "$branch_name" >/dev/null
-  git -C "$repo_path" checkout -B "$branch_name" "origin/$branch_name" >/dev/null
-  git -C "$repo_path" reset --hard "origin/$branch_name" >/dev/null
-  git -C "$repo_path" clean -fdx >/dev/null
 }
 
 ensure_qmk_clone() {
@@ -142,14 +131,46 @@ ensure_qmk_clone() {
 
 sync_qmk_branch() {
   local branch_name="firmware$1"
+  local current_branch=
+  local local_head=
+  local remote_head=
 
   ensure_qmk_clone
   git -C "$QMK_REPO" remote set-url origin "$QMK_REMOTE_URL"
   git -C "$QMK_REPO" fetch --prune origin "$branch_name" >/dev/null
+
+  current_branch=$(git -C "$QMK_REPO" branch --show-current)
+  local_head=$(git -C "$QMK_REPO" rev-parse HEAD)
+  remote_head=$(git -C "$QMK_REPO" rev-parse "origin/$branch_name")
+
+  if [[ $current_branch == "$branch_name" && $local_head == "$remote_head" ]]; then
+    printf 'Cached ZSA QMK checkout already matches %s; keeping existing worktree for build cache\n' "$branch_name"
+    return
+  fi
+
   git -C "$QMK_REPO" checkout -B "$branch_name" "origin/$branch_name" >/dev/null
   git -C "$QMK_REPO" reset --hard "origin/$branch_name" >/dev/null
   git -C "$QMK_REPO" clean -fdx >/dev/null
   git -C "$QMK_REPO" submodule update --init --recursive >/dev/null
+}
+
+prepare_run_workspace() {
+  rm -rf "$RUN_ROOT"
+  mkdir -p "$DOWNLOADED_LAYOUT_DIR"
+}
+
+update_local_oryx_branch() {
+  local commit_message=$1
+  local oryx_head=
+
+  oryx_head=$(git -C "$ORYX_REPO" rev-parse HEAD)
+  git -C "$REPO_ROOT" fetch "$ORYX_REPO" "$oryx_head:refs/heads/oryx" >/dev/null
+
+  if [[ -n $commit_message ]]; then
+    printf 'Updated local oryx branch: %s\n' "$commit_message"
+  else
+    printf 'Updated local oryx branch for %s\n' "$LAYOUT_ID"
+  fi
 }
 
 cleanup() {
@@ -159,7 +180,7 @@ cleanup() {
 
   if [[ $KEEP_TEMP -eq 1 ]]; then
     printf 'Per-run files preserved at: %s\n' "$RUN_ROOT" >&2
-    printf 'Persistent cached repos: %s %s %s\n' "$MAIN_REPO" "$ORYX_REPO" "$QMK_REPO" >&2
+    printf 'Persistent cached repo: %s\n' "$QMK_REPO" >&2
     exit "$exit_code"
   fi
 
@@ -169,6 +190,8 @@ cleanup() {
 }
 
 trap cleanup EXIT
+
+prepare_run_workspace
 
 GRAPHQL_QUERY='query getLayout($hashId: String!, $revisionId: String!, $geometry: String) { layout(hashId: $hashId, geometry: $geometry, revisionId: $revisionId) { revision { hashId qmkVersion title } } }'
 GRAPHQL_PAYLOAD=$(jq -cn \
@@ -189,15 +212,12 @@ CHANGE_DESCRIPTION=$(jq -r '.data.layout.revision.title // empty' <<<"$METADATA_
 [[ -n "$DOWNLOAD_HASH_ID" ]] || fail "Could not resolve the latest Oryx revision for layout $LAYOUT_ID"
 [[ -n "$FIRMWARE_VERSION" ]] || fail "Could not determine the QMK firmware version for layout $LAYOUT_ID"
 
-mkdir -p "$RUN_ROOT"
-mkdir -p "$DOWNLOADED_LAYOUT_DIR"
-
 printf 'Fetching Oryx layout %s (%s, firmware %s)\n' "$LAYOUT_ID" "$LAYOUT_GEOMETRY" "$FIRMWARE_VERSION"
 curl --fail --silent --show-error --location "https://oryx.zsa.io/source/${DOWNLOAD_HASH_ID}" -o "$SOURCE_ZIP"
 unzip -oj "$SOURCE_ZIP" '*_source/*' -d "$DOWNLOADED_LAYOUT_DIR" >/dev/null
 
-reset_clone "$MAIN_REPO" main
-reset_clone "$ORYX_REPO" oryx
+clone_branch "$MAIN_REPO" main
+clone_branch "$ORYX_REPO" oryx
 
 rm -rf "$ORYX_REPO/$LAYOUT_ID"
 mkdir -p "$ORYX_REPO/$LAYOUT_ID"
@@ -205,8 +225,12 @@ cp -R "$DOWNLOADED_LAYOUT_DIR"/. "$ORYX_REPO/$LAYOUT_ID"
 
 git -C "$ORYX_REPO" add "$LAYOUT_ID"
 if ! git -C "$ORYX_REPO" diff --cached --quiet; then
+  ORYX_COMMIT_MESSAGE=${CHANGE_DESCRIPTION:-Sync Oryx export for $LAYOUT_ID}
   git -C "$ORYX_REPO" -c user.name=local-builder -c user.email=local-builder@localhost \
-    commit -m "Sync Oryx export for $LAYOUT_ID" >/dev/null
+    commit -m "$ORYX_COMMIT_MESSAGE" >/dev/null
+  update_local_oryx_branch "$ORYX_COMMIT_MESSAGE"
+else
+  printf 'Local oryx branch already matches the downloaded export for %s\n' "$LAYOUT_ID"
 fi
 
 printf 'Merging Oryx export into custom branch state\n'
@@ -245,13 +269,9 @@ BUILT_LAYOUT_FILE=$(find "$QMK_REPO" -maxdepth 1 -type f \( -name "*${NORMALIZED
 [[ -n "$BUILT_LAYOUT_FILE" ]] || fail "Build succeeded but no firmware artifact was found"
 
 mkdir -p "$OUTPUT_DIR"
-MERGED_LAYOUT_OUTPUT_DIR=$OUTPUT_DIR/${LAYOUT_ID}
-rm -rf "$MERGED_LAYOUT_OUTPUT_DIR"
-cp -R "$MAIN_REPO/$LAYOUT_ID" "$MERGED_LAYOUT_OUTPUT_DIR"
 cp "$BUILT_LAYOUT_FILE" "$OUTPUT_DIR/"
 
 printf 'Build complete.\n'
-printf 'Merged layout: %s\n' "$MERGED_LAYOUT_OUTPUT_DIR"
 printf 'Firmware: %s\n' "$OUTPUT_DIR/$(basename "$BUILT_LAYOUT_FILE")"
 if [[ -n "$CHANGE_DESCRIPTION" ]]; then
   printf 'Oryx revision title: %s\n' "$CHANGE_DESCRIPTION"

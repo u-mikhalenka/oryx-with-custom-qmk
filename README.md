@@ -54,12 +54,12 @@ Example:
 
 The script will:
 1. Fetch the latest Oryx export for the requested layout.
-2. Reuse cached local `main` and `oryx` clones under `.local-build/cache` and merge them the same way as the workflow.
+2. Update the local `oryx` branch with that export when it changed, or report that it already matches, then merge it into a fresh `.local-build/run/main` workspace the same way as the workflow.
 3. Reuse a cached ZSA QMK checkout under `.local-build/qmk` and update it to the matching firmware branch.
 4. Copy the merged layout into that checkout and build on the local host.
-5. Copy the merged layout and compiled firmware into `.local-build/`.
+5. Copy the compiled firmware into `.local-build/`.
 
-Use `--keep-temp` if you want to inspect the per-run downloaded layout files after a failed merge or build.
+Use `--keep-temp` if you want to inspect `.local-build/run` after a failed merge or build.
 
 ## Oryx Chrome extension
 
