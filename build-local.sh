@@ -81,11 +81,14 @@ require_command make
 
 [[ -d $REPO_ROOT/.git ]] || fail "This script must live at the repository root"
 
+CURRENT_BRANCH=$(git -C "$REPO_ROOT" branch --show-current)
+[[ $CURRENT_BRANCH == main ]] || fail "This script must be run from a working copy checked out on the main branch"
+
 git -C "$REPO_ROOT" rev-parse --verify main >/dev/null 2>&1 || fail "Missing local branch: main"
 git -C "$REPO_ROOT" rev-parse --verify oryx >/dev/null 2>&1 || fail "Missing local branch: oryx"
 
 if [[ -n $(git -C "$REPO_ROOT" status --porcelain) ]]; then
-  printf 'Warning: repository has uncommitted changes; the build uses the committed tips of local main and oryx, and working-copy layout changes are ignored.\n' >&2
+  fail "Working tree has uncommitted changes. Commit or stash them before running this script because it now updates the checked-out main branch."
 fi
 
 if git -C "$REPO_ROOT" worktree list --porcelain | grep -Fxq 'branch refs/heads/oryx'; then
@@ -95,11 +98,9 @@ fi
 LOCAL_BUILD_ROOT=$REPO_ROOT/.local-build
 RUN_ROOT=$LOCAL_BUILD_ROOT/run
 QMK_REPO=$LOCAL_BUILD_ROOT/qmk
-ORYX_REMOTE_NAME=local-build-oryx
 QMK_REMOTE_URL=https://github.com/zsa/qmk_firmware.git
 
 mkdir -p "$LOCAL_BUILD_ROOT"
-MAIN_REPO=$RUN_ROOT/main
 ORYX_REPO=$RUN_ROOT/oryx
 DOWNLOADED_LAYOUT_DIR=$RUN_ROOT/downloaded-layout
 SOURCE_ZIP=$RUN_ROOT/source.zip
@@ -216,7 +217,6 @@ printf 'Fetching Oryx layout %s (%s, firmware %s)\n' "$LAYOUT_ID" "$LAYOUT_GEOME
 curl --fail --silent --show-error --location "https://oryx.zsa.io/source/${DOWNLOAD_HASH_ID}" -o "$SOURCE_ZIP"
 unzip -oj "$SOURCE_ZIP" '*_source/*' -d "$DOWNLOADED_LAYOUT_DIR" >/dev/null
 
-clone_branch "$MAIN_REPO" main
 clone_branch "$ORYX_REPO" oryx
 
 rm -rf "$ORYX_REPO/$LAYOUT_ID"
@@ -234,9 +234,7 @@ else
 fi
 
 printf 'Merging Oryx export into custom branch state\n'
-ORYX_HEAD=$(git -C "$MAIN_REPO" rev-parse HEAD)
-git -C "$MAIN_REPO" checkout -B main origin/main >/dev/null
-git -C "$MAIN_REPO" merge -Xignore-all-space --no-edit "$ORYX_HEAD" >/dev/null
+git -C "$REPO_ROOT" merge -Xignore-all-space --no-edit oryx >/dev/null
 
 printf 'Updating cached ZSA QMK checkout to firmware%s\n' "$FIRMWARE_VERSION"
 sync_qmk_branch "$FIRMWARE_VERSION"
@@ -252,7 +250,7 @@ fi
 TARGET_KEYMAP_DIR=$KEYBOARD_DIRECTORY/$LAYOUT_GEOMETRY/keymaps/$LAYOUT_ID
 rm -rf "$TARGET_KEYMAP_DIR"
 mkdir -p "$(dirname "$TARGET_KEYMAP_DIR")"
-cp -R "$MAIN_REPO/$LAYOUT_ID" "$TARGET_KEYMAP_DIR"
+cp -R "$REPO_ROOT/$LAYOUT_ID" "$TARGET_KEYMAP_DIR"
 
 printf 'Building firmware in %s\n' "$QMK_REPO"
 (
