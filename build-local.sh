@@ -98,41 +98,49 @@ fi
 LOCAL_BUILD_ROOT=$REPO_ROOT/.local-build
 CACHE_ROOT=$LOCAL_BUILD_ROOT/cache
 RUN_ROOT=$CACHE_ROOT/run
-MAIN_WORKTREE=$CACHE_ROOT/main
-ORYX_WORKTREE=$CACHE_ROOT/oryx
+MAIN_REPO=$CACHE_ROOT/main
+ORYX_REPO=$CACHE_ROOT/oryx
 DOWNLOADED_LAYOUT_DIR=$RUN_ROOT/downloaded-layout
 SOURCE_ZIP=$RUN_ROOT/source.zip
-MAIN_BRANCH=local-build-main
-ORYX_BRANCH=local-build-oryx
+ORYX_REMOTE_NAME=local-build-oryx
 
-ensure_worktree() {
-  local worktree_path=$1
+ensure_clone() {
+  local repo_path=$1
   local branch_name=$2
-  local start_point=$3
 
-  if git -C "$worktree_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if [[ -d $repo_path/.git ]] && git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     return
   fi
 
-  git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
-
-  if [[ -e $worktree_path ]]; then
-    rm -rf "$worktree_path"
+  if [[ -e $repo_path ]]; then
+    rm -rf "$repo_path"
   fi
 
-  mkdir -p "$(dirname "$worktree_path")"
-  git -C "$REPO_ROOT" worktree add -B "$branch_name" "$worktree_path" "$start_point" >/dev/null
+  mkdir -p "$(dirname "$repo_path")"
+  git clone --branch "$branch_name" "$REPO_ROOT" "$repo_path" >/dev/null
 }
 
-reset_worktree() {
-  local worktree_path=$1
+reset_clone() {
+  local repo_path=$1
   local branch_name=$2
-  local start_point=$3
 
-  ensure_worktree "$worktree_path" "$branch_name" "$start_point"
-  git -C "$worktree_path" checkout -B "$branch_name" "$start_point" >/dev/null
-  git -C "$worktree_path" reset --hard "$start_point" >/dev/null
-  git -C "$worktree_path" clean -fdx >/dev/null
+  ensure_clone "$repo_path" "$branch_name"
+  git -C "$repo_path" remote set-url origin "$REPO_ROOT"
+  git -C "$repo_path" fetch --prune origin "$branch_name" >/dev/null
+  git -C "$repo_path" checkout -B "$branch_name" "origin/$branch_name" >/dev/null
+  git -C "$repo_path" reset --hard "origin/$branch_name" >/dev/null
+  git -C "$repo_path" clean -fdx >/dev/null
+}
+
+fix_directory_ownership() {
+  local target_path=$1
+
+  [[ -e $target_path ]] || return 0
+
+  docker run --rm \
+    -v "$target_path:/work" \
+    debian:latest \
+    /bin/sh -lc "chown -R $(id -u):$(id -g) /work" >/dev/null
 }
 
 cleanup() {
@@ -142,7 +150,7 @@ cleanup() {
 
   if [[ $KEEP_TEMP -eq 1 ]]; then
     printf 'Per-run files preserved at: %s\n' "$RUN_ROOT" >&2
-    printf 'Persistent worktrees: %s %s\n' "$MAIN_WORKTREE" "$ORYX_WORKTREE" >&2
+    printf 'Persistent cached repos: %s %s\n' "$MAIN_REPO" "$ORYX_REPO" >&2
     exit "$exit_code"
   fi
 
@@ -179,59 +187,68 @@ printf 'Fetching Oryx layout %s (%s, firmware %s)\n' "$LAYOUT_ID" "$LAYOUT_GEOME
 curl --fail --silent --show-error --location "https://oryx.zsa.io/source/${DOWNLOAD_HASH_ID}" -o "$SOURCE_ZIP"
 unzip -oj "$SOURCE_ZIP" '*_source/*' -d "$DOWNLOADED_LAYOUT_DIR" >/dev/null
 
-reset_worktree "$MAIN_WORKTREE" "$MAIN_BRANCH" main
-reset_worktree "$ORYX_WORKTREE" "$ORYX_BRANCH" oryx
+reset_clone "$MAIN_REPO" main
+reset_clone "$ORYX_REPO" oryx
 
-rm -rf "$ORYX_WORKTREE/$LAYOUT_ID"
-mkdir -p "$ORYX_WORKTREE/$LAYOUT_ID"
-cp -R "$DOWNLOADED_LAYOUT_DIR"/. "$ORYX_WORKTREE/$LAYOUT_ID"
+rm -rf "$ORYX_REPO/$LAYOUT_ID"
+mkdir -p "$ORYX_REPO/$LAYOUT_ID"
+cp -R "$DOWNLOADED_LAYOUT_DIR"/. "$ORYX_REPO/$LAYOUT_ID"
 
-git -C "$ORYX_WORKTREE" add "$LAYOUT_ID"
-if ! git -C "$ORYX_WORKTREE" diff --cached --quiet; then
-  git -C "$ORYX_WORKTREE" -c user.name=local-builder -c user.email=local-builder@localhost \
+git -C "$ORYX_REPO" add "$LAYOUT_ID"
+if ! git -C "$ORYX_REPO" diff --cached --quiet; then
+  git -C "$ORYX_REPO" -c user.name=local-builder -c user.email=local-builder@localhost \
     commit -m "Sync Oryx export for $LAYOUT_ID" >/dev/null
 fi
 
 printf 'Merging Oryx export into custom branch state\n'
-git -C "$MAIN_WORKTREE" merge -Xignore-all-space --no-edit "$ORYX_BRANCH" >/dev/null
+if git -C "$MAIN_REPO" remote get-url "$ORYX_REMOTE_NAME" >/dev/null 2>&1; then
+  git -C "$MAIN_REPO" remote set-url "$ORYX_REMOTE_NAME" "$ORYX_REPO"
+else
+  git -C "$MAIN_REPO" remote add "$ORYX_REMOTE_NAME" "$ORYX_REPO"
+fi
+git -C "$MAIN_REPO" fetch "$ORYX_REMOTE_NAME" oryx >/dev/null
+git -C "$MAIN_REPO" merge -Xignore-all-space --no-edit "$ORYX_REMOTE_NAME/oryx" >/dev/null
 
 printf 'Updating qmk_firmware submodule to firmware%s\n' "$FIRMWARE_VERSION"
-git -C "$MAIN_WORKTREE" submodule update --init --remote --depth=1 --no-single-branch >/dev/null
-git -C "$MAIN_WORKTREE/qmk_firmware" checkout -B "firmware${FIRMWARE_VERSION}" "origin/firmware${FIRMWARE_VERSION}" >/dev/null
-git -C "$MAIN_WORKTREE/qmk_firmware" reset --hard "origin/firmware${FIRMWARE_VERSION}" >/dev/null
-git -C "$MAIN_WORKTREE/qmk_firmware" clean -fdx >/dev/null
-git -C "$MAIN_WORKTREE/qmk_firmware" submodule update --init --recursive >/dev/null
+git -C "$MAIN_REPO" submodule update --init --remote --depth=1 --no-single-branch >/dev/null
+git -C "$MAIN_REPO/qmk_firmware" checkout -B "firmware${FIRMWARE_VERSION}" "origin/firmware${FIRMWARE_VERSION}" >/dev/null
+git -C "$MAIN_REPO/qmk_firmware" reset --hard "origin/firmware${FIRMWARE_VERSION}" >/dev/null
+fix_directory_ownership "$MAIN_REPO/qmk_firmware"
+git -C "$MAIN_REPO/qmk_firmware" clean -fdx >/dev/null
+git -C "$MAIN_REPO/qmk_firmware" submodule update --init --recursive >/dev/null
 
 if (( FIRMWARE_VERSION >= 24 )); then
-  KEYBOARD_DIRECTORY=$MAIN_WORKTREE/qmk_firmware/keyboards/zsa
+  KEYBOARD_DIRECTORY=$MAIN_REPO/qmk_firmware/keyboards/zsa
   MAKE_PREFIX=zsa/
 else
-  KEYBOARD_DIRECTORY=$MAIN_WORKTREE/qmk_firmware/keyboards
+  KEYBOARD_DIRECTORY=$MAIN_REPO/qmk_firmware/keyboards
   MAKE_PREFIX=
 fi
 
 TARGET_KEYMAP_DIR=$KEYBOARD_DIRECTORY/$LAYOUT_GEOMETRY/keymaps/$LAYOUT_ID
 rm -rf "$TARGET_KEYMAP_DIR"
 mkdir -p "$(dirname "$TARGET_KEYMAP_DIR")"
-cp -R "$MAIN_WORKTREE/$LAYOUT_ID" "$TARGET_KEYMAP_DIR"
+cp -R "$MAIN_REPO/$LAYOUT_ID" "$TARGET_KEYMAP_DIR"
 
 printf 'Building Docker image %s\n' "$IMAGE_NAME"
-docker build -t "$IMAGE_NAME" "$MAIN_WORKTREE" >/dev/null
+docker build -f "$REPO_ROOT/Dockerfile" -t "$IMAGE_NAME" "$MAIN_REPO" >/dev/null
 
 printf 'Building firmware inside Docker\n'
 docker run --rm \
-  -v "$MAIN_WORKTREE/qmk_firmware:/root" \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  -v "$MAIN_REPO/qmk_firmware:/work" \
   "$IMAGE_NAME" \
-  /bin/sh -lc "qmk setup zsa/qmk_firmware -b firmware${FIRMWARE_VERSION} -y && make ${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
+  /bin/sh -lc "cd /work && make ${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
 
 NORMALIZED_GEOMETRY=${LAYOUT_GEOMETRY//\//_}
-BUILT_LAYOUT_FILE=$(find "$MAIN_WORKTREE/qmk_firmware" -maxdepth 1 -type f \( -name "*${NORMALIZED_GEOMETRY}*.bin" -o -name "*${NORMALIZED_GEOMETRY}*.hex" \) | head -n 1)
+BUILT_LAYOUT_FILE=$(find "$MAIN_REPO/qmk_firmware" -maxdepth 1 -type f \( -name "*${NORMALIZED_GEOMETRY}*.bin" -o -name "*${NORMALIZED_GEOMETRY}*.hex" \) | head -n 1)
 [[ -n "$BUILT_LAYOUT_FILE" ]] || fail "Build succeeded but no firmware artifact was found"
 
 mkdir -p "$OUTPUT_DIR"
 MERGED_LAYOUT_OUTPUT_DIR=$OUTPUT_DIR/${LAYOUT_ID}
 rm -rf "$MERGED_LAYOUT_OUTPUT_DIR"
-cp -R "$MAIN_WORKTREE/$LAYOUT_ID" "$MERGED_LAYOUT_OUTPUT_DIR"
+cp -R "$MAIN_REPO/$LAYOUT_ID" "$MERGED_LAYOUT_OUTPUT_DIR"
 cp "$BUILT_LAYOUT_FILE" "$OUTPUT_DIR/"
 
 printf 'Build complete.\n'

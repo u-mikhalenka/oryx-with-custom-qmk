@@ -51,12 +51,12 @@ Example:
 
 The script will:
 1. Fetch the latest Oryx export for the requested layout.
-2. Create temporary `main` and `oryx` worktrees and merge them the same way as the workflow.
+2. Reuse cached local `main` and `oryx` clones under `.local-build/cache` and merge them the same way as the workflow.
 3. Check out the matching QMK firmware branch in the submodule.
 4. Build the firmware in Docker.
 5. Copy the merged layout and compiled firmware into `.local-build/`.
 
-Use `--keep-temp` if you want to inspect the temporary worktrees after a failed merge or build.
+Use `--keep-temp` if you want to inspect the per-run downloaded layout files after a failed merge or build.
 
 ## Oryx Chrome extension
 
