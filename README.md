@@ -32,6 +32,32 @@ Each time you run the GitHub Action, the workflow will:
 7. Flash your downloaded firmware using [Keymapp](https://www.zsa.io/flash#flash-keymap).
 8. Enjoy!
 
+## Build locally
+
+You can reproduce the GitHub Action locally with [build-local.sh](build-local.sh).
+
+Requirements:
+- `git`
+- `curl`
+- `jq`
+- `unzip`
+- `docker`
+
+Example:
+
+```bash
+./build-local.sh --layout-id X3nL6 --geometry voyager
+```
+
+The script will:
+1. Fetch the latest Oryx export for the requested layout.
+2. Create temporary `main` and `oryx` worktrees and merge them the same way as the workflow.
+3. Check out the matching QMK firmware branch in the submodule.
+4. Build the firmware in Docker.
+5. Copy the merged layout and compiled firmware into `.local-build/`.
+
+Use `--keep-temp` if you want to inspect the temporary worktrees after a failed merge or build.
+
 ## Oryx Chrome extension
 
 To make building even easier, [@nivekmai](https://github.com/nivekmai) created an [Oryx Chrome extension](https://chromewebstore.google.com/detail/oryx-extension/bocjciklgnhkejkdfilcikhjfbmbcjal) to be able to trigger the GitHub Actions from inside Oryx itself.
