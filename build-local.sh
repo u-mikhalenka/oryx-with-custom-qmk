@@ -7,11 +7,9 @@ usage() {
 Usage: ./build-local.sh --layout-id ID [options]
 
 Options:
-  --layout-id ID        Oryx layout id to fetch and build.
+  --layout-id ID        Oryx layout id to fetch and build. Default: X3nL6
   --geometry NAME       Keyboard geometry. Default: voyager
   --output-dir PATH     Directory for the merged layout and firmware. Default: .local-build
-  --image-name NAME     Docker image tag to use for the local QMK builder. Default: qmk-local-builder
-  --use-docker          Build firmware in Docker instead of on the local host.
   --keep-temp           Preserve per-run downloaded files for debugging.
   --help                Show this help text.
 EOF
@@ -36,8 +34,6 @@ REPO_ROOT=$SCRIPT_DIR
 LAYOUT_ID=X3nL6
 LAYOUT_GEOMETRY=voyager
 OUTPUT_DIR=$REPO_ROOT/.local-build
-IMAGE_NAME=qmk-local-builder
-USE_DOCKER=0
 KEEP_TEMP=0
 
 while [[ $# -gt 0 ]]; do
@@ -60,15 +56,6 @@ while [[ $# -gt 0 ]]; do
       esac
       shift 2
       ;;
-    --image-name)
-      [[ $# -ge 2 ]] || fail "--image-name requires a value"
-      IMAGE_NAME=$2
-      shift 2
-      ;;
-    --use-docker)
-      USE_DOCKER=1
-      shift
-      ;;
     --keep-temp)
       KEEP_TEMP=1
       shift
@@ -89,20 +76,10 @@ require_command git
 require_command curl
 require_command jq
 require_command unzip
-
-if [[ $USE_DOCKER -eq 1 ]]; then
-  require_command docker
-else
-  [[ $OSTYPE == darwin* ]] || fail "Local host builds are only supported on macOS. Use --use-docker on other platforms."
-  require_command make
-  require_command qmk
-fi
+[[ $OSTYPE == darwin* ]] || fail "Local host builds are only supported on macOS."
+require_command make
 
 [[ -d $REPO_ROOT/.git ]] || fail "This script must live at the repository root"
-
-if [[ $USE_DOCKER -eq 1 ]]; then
-  [[ -f $REPO_ROOT/Dockerfile ]] || fail "Dockerfile not found at repository root"
-fi
 
 git -C "$REPO_ROOT" rev-parse --verify main >/dev/null 2>&1 || fail "Missing local branch: main"
 git -C "$REPO_ROOT" rev-parse --verify oryx >/dev/null 2>&1 || fail "Missing local branch: oryx"
@@ -116,9 +93,11 @@ CACHE_ROOT=$LOCAL_BUILD_ROOT/cache
 RUN_ROOT=$CACHE_ROOT/run
 MAIN_REPO=$CACHE_ROOT/main
 ORYX_REPO=$CACHE_ROOT/oryx
+QMK_REPO=$LOCAL_BUILD_ROOT/qmk
 DOWNLOADED_LAYOUT_DIR=$RUN_ROOT/downloaded-layout
 SOURCE_ZIP=$RUN_ROOT/source.zip
 ORYX_REMOTE_NAME=local-build-oryx
+QMK_REMOTE_URL=https://github.com/zsa/qmk_firmware.git
 
 ensure_clone() {
   local repo_path=$1
@@ -148,17 +127,29 @@ reset_clone() {
   git -C "$repo_path" clean -fdx >/dev/null
 }
 
-fix_directory_ownership() {
-  local target_path=$1
+ensure_qmk_clone() {
+  if [[ -d $QMK_REPO/.git ]] && git -C "$QMK_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
 
-  [[ -e $target_path ]] || return 0
+  if [[ -e $QMK_REPO ]]; then
+    rm -rf "$QMK_REPO"
+  fi
 
-  [[ $USE_DOCKER -eq 1 ]] || return 0
+  mkdir -p "$LOCAL_BUILD_ROOT"
+  git clone --filter=blob:none "$QMK_REMOTE_URL" "$QMK_REPO" >/dev/null
+}
 
-  docker run --rm \
-    -v "$target_path:/work" \
-    debian:latest \
-    /bin/sh -lc "chown -R $(id -u):$(id -g) /work" >/dev/null
+sync_qmk_branch() {
+  local branch_name="firmware$1"
+
+  ensure_qmk_clone
+  git -C "$QMK_REPO" remote set-url origin "$QMK_REMOTE_URL"
+  git -C "$QMK_REPO" fetch --prune origin "$branch_name" >/dev/null
+  git -C "$QMK_REPO" checkout -B "$branch_name" "origin/$branch_name" >/dev/null
+  git -C "$QMK_REPO" reset --hard "origin/$branch_name" >/dev/null
+  git -C "$QMK_REPO" clean -fdx >/dev/null
+  git -C "$QMK_REPO" submodule update --init --recursive >/dev/null
 }
 
 cleanup() {
@@ -168,7 +159,7 @@ cleanup() {
 
   if [[ $KEEP_TEMP -eq 1 ]]; then
     printf 'Per-run files preserved at: %s\n' "$RUN_ROOT" >&2
-    printf 'Persistent cached repos: %s %s\n' "$MAIN_REPO" "$ORYX_REPO" >&2
+    printf 'Persistent cached repos: %s %s %s\n' "$MAIN_REPO" "$ORYX_REPO" "$QMK_REPO" >&2
     exit "$exit_code"
   fi
 
@@ -227,19 +218,14 @@ fi
 git -C "$MAIN_REPO" fetch "$ORYX_REMOTE_NAME" oryx >/dev/null
 git -C "$MAIN_REPO" merge -Xignore-all-space --no-edit "$ORYX_REMOTE_NAME/oryx" >/dev/null
 
-printf 'Updating qmk_firmware submodule to firmware%s\n' "$FIRMWARE_VERSION"
-git -C "$MAIN_REPO" submodule update --init --remote --depth=1 --no-single-branch >/dev/null
-git -C "$MAIN_REPO/qmk_firmware" checkout -B "firmware${FIRMWARE_VERSION}" "origin/firmware${FIRMWARE_VERSION}" >/dev/null
-git -C "$MAIN_REPO/qmk_firmware" reset --hard "origin/firmware${FIRMWARE_VERSION}" >/dev/null
-fix_directory_ownership "$MAIN_REPO/qmk_firmware"
-git -C "$MAIN_REPO/qmk_firmware" clean -fdx >/dev/null
-git -C "$MAIN_REPO/qmk_firmware" submodule update --init --recursive >/dev/null
+printf 'Updating cached ZSA QMK checkout to firmware%s\n' "$FIRMWARE_VERSION"
+sync_qmk_branch "$FIRMWARE_VERSION"
 
 if (( FIRMWARE_VERSION >= 24 )); then
-  KEYBOARD_DIRECTORY=$MAIN_REPO/qmk_firmware/keyboards/zsa
+  KEYBOARD_DIRECTORY=$QMK_REPO/keyboards/zsa
   MAKE_PREFIX=zsa/
 else
-  KEYBOARD_DIRECTORY=$MAIN_REPO/qmk_firmware/keyboards
+  KEYBOARD_DIRECTORY=$QMK_REPO/keyboards
   MAKE_PREFIX=
 fi
 
@@ -248,27 +234,14 @@ rm -rf "$TARGET_KEYMAP_DIR"
 mkdir -p "$(dirname "$TARGET_KEYMAP_DIR")"
 cp -R "$MAIN_REPO/$LAYOUT_ID" "$TARGET_KEYMAP_DIR"
 
-if [[ $USE_DOCKER -eq 1 ]]; then
-  printf 'Building Docker image %s\n' "$IMAGE_NAME"
-  docker build -f "$REPO_ROOT/Dockerfile" -t "$IMAGE_NAME" "$MAIN_REPO" >/dev/null
-
-  printf 'Building firmware inside Docker\n'
-  docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp \
-    -v "$MAIN_REPO/qmk_firmware:/work" \
-    "$IMAGE_NAME" \
-    /bin/sh -lc "cd /work && make ${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
-else
-  printf 'Building firmware on the local host\n'
-  (
-    cd "$MAIN_REPO/qmk_firmware"
-    make "${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
-  )
-fi
+printf 'Building firmware in %s\n' "$QMK_REPO"
+(
+  cd "$QMK_REPO"
+  make "${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
+)
 
 NORMALIZED_GEOMETRY=${LAYOUT_GEOMETRY//\//_}
-BUILT_LAYOUT_FILE=$(find "$MAIN_REPO/qmk_firmware" -maxdepth 1 -type f \( -name "*${NORMALIZED_GEOMETRY}*.bin" -o -name "*${NORMALIZED_GEOMETRY}*.hex" \) | head -n 1)
+BUILT_LAYOUT_FILE=$(find "$QMK_REPO" -maxdepth 1 -type f \( -name "*${NORMALIZED_GEOMETRY}*.bin" -o -name "*${NORMALIZED_GEOMETRY}*.hex" \) | head -n 1)
 [[ -n "$BUILT_LAYOUT_FILE" ]] || fail "Build succeeded but no firmware artifact was found"
 
 mkdir -p "$OUTPUT_DIR"
