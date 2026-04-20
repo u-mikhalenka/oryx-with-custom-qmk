@@ -11,7 +11,7 @@ Options:
   --geometry NAME       Keyboard geometry. Default: voyager
   --output-dir PATH     Directory for the merged layout and firmware. Default: .local-build
   --image-name NAME     Docker image tag to use for the local QMK builder. Default: qmk-local-builder
-  --keep-temp           Preserve temporary worktrees for debugging.
+  --keep-temp           Preserve per-run downloaded files for debugging.
   --help                Show this help text.
 EOF
 }
@@ -84,7 +84,6 @@ require_command curl
 require_command jq
 require_command unzip
 require_command docker
-require_command mktemp
 
 [[ -d $REPO_ROOT/.git ]] || fail "This script must live at the repository root"
 [[ -f $REPO_ROOT/Dockerfile ]] || fail "Dockerfile not found at repository root"
@@ -96,12 +95,45 @@ if [[ -n $(git -C "$REPO_ROOT" status --porcelain) ]]; then
   printf 'Warning: repository has uncommitted changes; the build uses the committed tips of the local main and oryx branches.\n' >&2
 fi
 
-TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/oryx-local-build.XXXXXX")
-MAIN_WORKTREE=$TEMP_ROOT/main
-ORYX_WORKTREE=$TEMP_ROOT/oryx
-DOWNLOADED_LAYOUT_DIR=$TEMP_ROOT/downloaded-layout
-MAIN_BRANCH=local-build-main-$$-$(date +%s)
-ORYX_BRANCH=local-build-oryx-$$-$(date +%s)
+LOCAL_BUILD_ROOT=$REPO_ROOT/.local-build
+CACHE_ROOT=$LOCAL_BUILD_ROOT/cache
+RUN_ROOT=$CACHE_ROOT/run
+MAIN_WORKTREE=$CACHE_ROOT/main
+ORYX_WORKTREE=$CACHE_ROOT/oryx
+DOWNLOADED_LAYOUT_DIR=$RUN_ROOT/downloaded-layout
+SOURCE_ZIP=$RUN_ROOT/source.zip
+MAIN_BRANCH=local-build-main
+ORYX_BRANCH=local-build-oryx
+
+ensure_worktree() {
+  local worktree_path=$1
+  local branch_name=$2
+  local start_point=$3
+
+  if git -C "$worktree_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+
+  if [[ -e $worktree_path ]]; then
+    rm -rf "$worktree_path"
+  fi
+
+  mkdir -p "$(dirname "$worktree_path")"
+  git -C "$REPO_ROOT" worktree add -B "$branch_name" "$worktree_path" "$start_point" >/dev/null
+}
+
+reset_worktree() {
+  local worktree_path=$1
+  local branch_name=$2
+  local start_point=$3
+
+  ensure_worktree "$worktree_path" "$branch_name" "$start_point"
+  git -C "$worktree_path" checkout -B "$branch_name" "$start_point" >/dev/null
+  git -C "$worktree_path" reset --hard "$start_point" >/dev/null
+  git -C "$worktree_path" clean -fdx >/dev/null
+}
 
 cleanup() {
   local exit_code=$?
@@ -109,16 +141,12 @@ cleanup() {
   set +e
 
   if [[ $KEEP_TEMP -eq 1 ]]; then
-    printf 'Temporary worktrees preserved at: %s\n' "$TEMP_ROOT" >&2
-    printf 'Temporary branches preserved: %s %s\n' "$MAIN_BRANCH" "$ORYX_BRANCH" >&2
+    printf 'Per-run files preserved at: %s\n' "$RUN_ROOT" >&2
+    printf 'Persistent worktrees: %s %s\n' "$MAIN_WORKTREE" "$ORYX_WORKTREE" >&2
     exit "$exit_code"
   fi
 
-  git -C "$REPO_ROOT" worktree remove --force "$MAIN_WORKTREE" >/dev/null 2>&1 || true
-  git -C "$REPO_ROOT" worktree remove --force "$ORYX_WORKTREE" >/dev/null 2>&1 || true
-  git -C "$REPO_ROOT" branch -D "$MAIN_BRANCH" >/dev/null 2>&1 || true
-  git -C "$REPO_ROOT" branch -D "$ORYX_BRANCH" >/dev/null 2>&1 || true
-  rm -rf "$TEMP_ROOT"
+  rm -rf "$RUN_ROOT"
 
   exit "$exit_code"
 }
@@ -138,21 +166,21 @@ METADATA_RESPONSE=$(curl --fail --silent --show-error --location \
   --data "$GRAPHQL_PAYLOAD")
 
 DOWNLOAD_HASH_ID=$(jq -r '.data.layout.revision.hashId // empty' <<<"$METADATA_RESPONSE")
-FIRMWARE_VERSION=$(jq -r '(.data.layout.revision.qmkVersion // empty) | floor | tostring' <<<"$METADATA_RESPONSE")
+FIRMWARE_VERSION=$(jq -r '(.data.layout.revision.qmkVersion // empty) | tonumber? | floor | tostring // empty' <<<"$METADATA_RESPONSE")
 CHANGE_DESCRIPTION=$(jq -r '.data.layout.revision.title // empty' <<<"$METADATA_RESPONSE")
 
 [[ -n "$DOWNLOAD_HASH_ID" ]] || fail "Could not resolve the latest Oryx revision for layout $LAYOUT_ID"
 [[ -n "$FIRMWARE_VERSION" ]] || fail "Could not determine the QMK firmware version for layout $LAYOUT_ID"
 
+mkdir -p "$RUN_ROOT"
 mkdir -p "$DOWNLOADED_LAYOUT_DIR"
-SOURCE_ZIP=$TEMP_ROOT/source.zip
 
 printf 'Fetching Oryx layout %s (%s, firmware %s)\n' "$LAYOUT_ID" "$LAYOUT_GEOMETRY" "$FIRMWARE_VERSION"
 curl --fail --silent --show-error --location "https://oryx.zsa.io/source/${DOWNLOAD_HASH_ID}" -o "$SOURCE_ZIP"
 unzip -oj "$SOURCE_ZIP" '*_source/*' -d "$DOWNLOADED_LAYOUT_DIR" >/dev/null
 
-git -C "$REPO_ROOT" worktree add -b "$MAIN_BRANCH" "$MAIN_WORKTREE" main >/dev/null
-git -C "$REPO_ROOT" worktree add -b "$ORYX_BRANCH" "$ORYX_WORKTREE" oryx >/dev/null
+reset_worktree "$MAIN_WORKTREE" "$MAIN_BRANCH" main
+reset_worktree "$ORYX_WORKTREE" "$ORYX_BRANCH" oryx
 
 rm -rf "$ORYX_WORKTREE/$LAYOUT_ID"
 mkdir -p "$ORYX_WORKTREE/$LAYOUT_ID"
@@ -170,6 +198,8 @@ git -C "$MAIN_WORKTREE" merge -Xignore-all-space --no-edit "$ORYX_BRANCH" >/dev/
 printf 'Updating qmk_firmware submodule to firmware%s\n' "$FIRMWARE_VERSION"
 git -C "$MAIN_WORKTREE" submodule update --init --remote --depth=1 --no-single-branch >/dev/null
 git -C "$MAIN_WORKTREE/qmk_firmware" checkout -B "firmware${FIRMWARE_VERSION}" "origin/firmware${FIRMWARE_VERSION}" >/dev/null
+git -C "$MAIN_WORKTREE/qmk_firmware" reset --hard "origin/firmware${FIRMWARE_VERSION}" >/dev/null
+git -C "$MAIN_WORKTREE/qmk_firmware" clean -fdx >/dev/null
 git -C "$MAIN_WORKTREE/qmk_firmware" submodule update --init --recursive >/dev/null
 
 if (( FIRMWARE_VERSION >= 24 )); then
