@@ -11,6 +11,7 @@ Options:
   --geometry NAME       Keyboard geometry. Default: voyager
   --output-dir PATH     Directory for the merged layout and firmware. Default: .local-build
   --image-name NAME     Docker image tag to use for the local QMK builder. Default: qmk-local-builder
+  --use-docker          Build firmware in Docker instead of on the local host.
   --keep-temp           Preserve per-run downloaded files for debugging.
   --help                Show this help text.
 EOF
@@ -32,10 +33,11 @@ require_command() {
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$SCRIPT_DIR
 
-LAYOUT_ID=
+LAYOUT_ID=X3nL6
 LAYOUT_GEOMETRY=voyager
 OUTPUT_DIR=$REPO_ROOT/.local-build
 IMAGE_NAME=qmk-local-builder
+USE_DOCKER=0
 KEEP_TEMP=0
 
 while [[ $# -gt 0 ]]; do
@@ -63,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       IMAGE_NAME=$2
       shift 2
       ;;
+    --use-docker)
+      USE_DOCKER=1
+      shift
+      ;;
     --keep-temp)
       KEEP_TEMP=1
       shift
@@ -83,10 +89,20 @@ require_command git
 require_command curl
 require_command jq
 require_command unzip
-require_command docker
+
+if [[ $USE_DOCKER -eq 1 ]]; then
+  require_command docker
+else
+  [[ $OSTYPE == darwin* ]] || fail "Local host builds are only supported on macOS. Use --use-docker on other platforms."
+  require_command make
+  require_command qmk
+fi
 
 [[ -d $REPO_ROOT/.git ]] || fail "This script must live at the repository root"
-[[ -f $REPO_ROOT/Dockerfile ]] || fail "Dockerfile not found at repository root"
+
+if [[ $USE_DOCKER -eq 1 ]]; then
+  [[ -f $REPO_ROOT/Dockerfile ]] || fail "Dockerfile not found at repository root"
+fi
 
 git -C "$REPO_ROOT" rev-parse --verify main >/dev/null 2>&1 || fail "Missing local branch: main"
 git -C "$REPO_ROOT" rev-parse --verify oryx >/dev/null 2>&1 || fail "Missing local branch: oryx"
@@ -136,6 +152,8 @@ fix_directory_ownership() {
   local target_path=$1
 
   [[ -e $target_path ]] || return 0
+
+  [[ $USE_DOCKER -eq 1 ]] || return 0
 
   docker run --rm \
     -v "$target_path:/work" \
@@ -230,16 +248,24 @@ rm -rf "$TARGET_KEYMAP_DIR"
 mkdir -p "$(dirname "$TARGET_KEYMAP_DIR")"
 cp -R "$MAIN_REPO/$LAYOUT_ID" "$TARGET_KEYMAP_DIR"
 
-printf 'Building Docker image %s\n' "$IMAGE_NAME"
-docker build -f "$REPO_ROOT/Dockerfile" -t "$IMAGE_NAME" "$MAIN_REPO" >/dev/null
+if [[ $USE_DOCKER -eq 1 ]]; then
+  printf 'Building Docker image %s\n' "$IMAGE_NAME"
+  docker build -f "$REPO_ROOT/Dockerfile" -t "$IMAGE_NAME" "$MAIN_REPO" >/dev/null
 
-printf 'Building firmware inside Docker\n'
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -e HOME=/tmp \
-  -v "$MAIN_REPO/qmk_firmware:/work" \
-  "$IMAGE_NAME" \
-  /bin/sh -lc "cd /work && make ${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
+  printf 'Building firmware inside Docker\n'
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp \
+    -v "$MAIN_REPO/qmk_firmware:/work" \
+    "$IMAGE_NAME" \
+    /bin/sh -lc "cd /work && make ${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
+else
+  printf 'Building firmware on the local host\n'
+  (
+    cd "$MAIN_REPO/qmk_firmware"
+    make "${MAKE_PREFIX}${LAYOUT_GEOMETRY}:${LAYOUT_ID}"
+  )
+fi
 
 NORMALIZED_GEOMETRY=${LAYOUT_GEOMETRY//\//_}
 BUILT_LAYOUT_FILE=$(find "$MAIN_REPO/qmk_firmware" -maxdepth 1 -type f \( -name "*${NORMALIZED_GEOMETRY}*.bin" -o -name "*${NORMALIZED_GEOMETRY}*.hex" \) | head -n 1)

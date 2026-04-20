@@ -41,6 +41,12 @@ Requirements:
 - `curl`
 - `jq`
 - `unzip`
+
+Host build requirements on macOS:
+- `make`
+- `qmk` installed, for example via `brew install qmk/qmk/qmk`
+
+Docker build requirements:
 - `docker`
 
 Example:
@@ -49,11 +55,17 @@ Example:
 ./build-local.sh --layout-id X3nL6 --geometry voyager
 ```
 
+Use Docker explicitly if you want the previous containerized build path:
+
+```bash
+./build-local.sh --layout-id X3nL6 --geometry voyager --use-docker
+```
+
 The script will:
 1. Fetch the latest Oryx export for the requested layout.
 2. Reuse cached local `main` and `oryx` clones under `.local-build/cache` and merge them the same way as the workflow.
 3. Check out the matching QMK firmware branch in the submodule.
-4. Build the firmware in Docker.
+4. Build the firmware on the local host by default on macOS, or in Docker when `--use-docker` is passed.
 5. Copy the merged layout and compiled firmware into `.local-build/`.
 
 Use `--keep-temp` if you want to inspect the per-run downloaded layout files after a failed merge or build.
